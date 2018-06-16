@@ -103,17 +103,9 @@ command :clone do |c|
   end
 end
 
-command :pr do |c|
-  c.action do |args, options|
-
-  end
-end
-
 def create_pr(new_repo)
   origin_pull_requests.each {|pr| say "[#{pr.number}] #{pr.head.ref}: #{pr.title}" }
-  pr_number = ask('Which Pull Request? ') do |q|
-    q.character = true
-  end
+  pr_number = ask('Which Pull Request? ')
   selected = origin_pull_requests.detect {|pr| pr.number.to_i == pr_number.to_i }
   exit unless selected
   branch = selected.head.ref
