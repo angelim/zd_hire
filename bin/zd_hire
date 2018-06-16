@@ -112,10 +112,7 @@ def create_pr(new_repo)
   command = [
     "cd #{new_repo.name}",
     "git checkout -b #{branch}",
-    "git pull #{config.local_path} #{branch} --allow-unrelated-histories --no-edit",
-    "git reset $(git merge-base master #{branch})",
-    'git add -A',
-    "git commit -m '#{selected.title}'",
+    "git pull #{config.local_path} #{branch} --no-edit",
     "git push origin #{branch}"
   ].join(' && ')
   
@@ -181,9 +178,7 @@ end
 def clone_repository(origin, target)
   system(
     [
-      "git clone --depth 1 -b master git@github.com:#{origin}.git #{target}",
-      "cd #{target}",
-      'rm -rf .git'
+      "git clone git@github.com:#{origin}.git -b master --single-branch #{target}",
     ].join(' && ')
   )
 end
@@ -192,10 +187,7 @@ def setup_remote(target_dir, remote_repo)
   system(
     [
       "cd #{target_dir}",
-      'git init',
-      'git add .',
-      'git commit -m "first commit"',
-      "git remote add origin #{remote_repo.ssh_url}",
+      "git remote set-url origin #{remote_repo.ssh_url}",
       'git push -u origin master'
     ].join(' && ')
   )
