@@ -103,6 +103,35 @@ command :clone do |c|
   end
 end
 
+command :pr do |c|
+  c.action do |args, options|
+
+  end
+end
+
+def create_pr(new_repo)
+  origin_pull_requests.each {|pr| say "[#{pr.number}] #{pr.head.ref}: #{pr.title}" }
+  pr_number = ask('Which Pull Request? ') do |q|
+    q.character = true
+  end
+  selected = origin_pull_requests.detect {|pr| pr.number.to_i == pr_number.to_i }
+  exit unless selected
+  branch = selected.head.ref
+  command = [
+    "cd #{new_repo.name}",
+    "git checkout -b #{branch}",
+    "git pull #{config.local_path} #{branch} --allow-unrelated-histories --no-edit",
+    "git reset $(git merge-base master #{branch})",
+    'git add -A',
+    "git commit -m '#{selected.title}'",
+    "git push origin #{branch}"
+  ].join(' && ')
+  
+  `#{command}`
+  sleep 1
+  github.create_pull_request(new_repo.full_name, 'master', branch, selected.title, selected.body)
+end
+
 def origin_default_issue
   @df ||= origin_repo_issues.detect{|issue| issue.labels.any?{ |l| l.name == DEFAULT_ISSUE_LABEL} }
 end
@@ -130,6 +159,10 @@ end
 
 def origin_repo_issues(options = {})
   @rp ||= github.issues(config.origin_repo, options).reject(&:pull_request)
+end
+
+def origin_pull_requests
+  @prs ||= github.pull_requests(config.origin_repo)
 end
 
 def copy_and_report_issues(target)
@@ -196,6 +229,10 @@ def create_project(target)
 
     if agree("Would you like to select issues to copy(y/n) ", true)
       copy_and_report_issues(new_repo.full_name)
+    end
+
+    if agree("Would you like to copy a Pull Request(y/n) ", true)
+      create_pr(new_repo)
     end
 
     if agree('Would you like to open the project in your browser?(y/n) ', true)
