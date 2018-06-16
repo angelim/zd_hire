@@ -1,0 +1,214 @@
+#!/usr/bin/env ruby
+
+require "bundler/setup"
+require "zd_hire"
+require 'commander/import'
+require 'octokit'
+
+program :name, 'ZdHire'
+program :version, ZdHire::VERSION
+program :description, 'Hire developers using Github'
+default_command :init
+
+QUESTIONS = {
+  repo: 'Github Repository(user/repo): ',
+  issues: 'Github Issue Ids: ',
+  target_repo: 'New repository name: '
+}
+
+PRIVATE_SECTION_SEPARATOR = '## PRIVATE'
+EVALUATION_SEPARATOR = '## EVALUATION'
+DEFAULT_ISSUE_LABEL = 'default_issue'
+
+def token_validator
+  ->(token) {
+    @client = Octokit::Client.new(access_token: token)
+    @client.user rescue false
+  }
+end
+
+def origin_validator
+  ->(repo) {
+    return false if repo !~ /\w+\/\w+/
+    github.repo(repo) rescue false
+  }
+end
+
+def target_validator
+  ->(target) { target != config.origin_repo }
+end
+
+def local_origin_validator
+  ->(path) { File.directory?(File.expand_path(path)) }
+end
+
+def config
+  @config ||= ZdHire::Config.new  
+end
+
+def github
+  @client ||= Octokit::Client.new(access_token: config.github_token)
+end
+
+command :init do |c|
+  c.syntax = 'zd_hire init'
+  c.description = 'Configures ZdHire'
+  c.action do |args, options|
+    if config.valid?
+      say "Current Configuration: #{config.attributes}"
+      if agree('Would you like to exit initialization?(y/n) ', true)
+        exit
+      end
+    end
+    say 'Initializing Configuration'
+
+    if agree('Would you like to create a new Github access token?(y/n) ', true)
+      system "open https://github.com/settings/tokens"
+    end
+
+    config.github_token = ask("Github access token(needs repo, read:org and read:user scopes): ") do |q|
+      q.validate = token_validator
+      q.responses.merge!(not_valid: "Couldn't connect to github with token. Try again.")
+    end
+
+    config.origin_repo = ask("Origin Github Repository(username/repo): ") do |q|
+      q.validate = origin_validator
+      q.responses.merge!(not_valid: "Couldn't retrieve repository with credentials. Use the format 'username/repo'")
+    end
+
+    config.local_path = ask("Local repository path: ") do |q|
+      q.validate = local_origin_validator
+      q.responses.merge!(not_valid: "Couldn't find repo path in local filesystem. E.g (~/Code/myrepo)")
+    end
+
+    config.branch = ask("Default branch to export: ") { |q| q.default = 'master' }
+    config.serialize_to_file
+  end
+end
+
+command :clone do |c|
+  c.action do |args, options|
+    if config.valid?
+      target = ask(QUESTIONS[:target_repo]) do |q|
+        q.validate = target_validator
+        q.responses.merge!(not_valid: "Target and origin repositories can't be the same")
+      end
+      clone_repository(config.origin_repo, target)
+    else
+      say 'Run `zd_hire init` to configure github keys'
+    end
+    if agree('Would you like to create a Github Project?(y/n) ', true)
+      create_project(target)
+    end
+  end
+end
+
+def origin_default_issue
+  @df ||= origin_repo_issues.detect{|issue| issue.labels.any?{ |l| l.name == DEFAULT_ISSUE_LABEL} }
+end
+
+def evaluation_items(issue)
+  return [] unless issue
+  evaluation_text = issue.body.split(EVALUATION_SEPARATOR).last
+  evaluation_items = evaluation_text.lines.map(&:chomp)
+  evaluation_items.delete('')
+  evaluation_items
+end
+
+def evaluation_item_report(issue)
+  default_items = evaluation_items(origin_default_issue)
+  issue_type = issue.title.match(/\[(\w+)\]/)[1] rescue issue.number
+  issue_items = evaluation_items(issue)
+  (issue_items + default_items).compact.map { |item| [issue_type, item].join(', ') }
+end
+
+def presentable_issues
+  @presentable ||= origin_repo_issues.reject do |issue|
+    issue.number.to_i == origin_default_issue&.number&.to_i
+  end
+end
+
+def origin_repo_issues(options = {})
+  @rp ||= github.issues(config.origin_repo, options).reject(&:pull_request)
+end
+
+def copy_and_report_issues(target)
+  issues = presentable_issues
+  issues.each { |i| say "#{i.number}: #{i.title}" }
+  issue_ids = ask('Type Issue IDs separated by spaces: ', Array).map(&:to_i)
+  selected_issues = issues.select do |issue|
+    issue_ids.include?(issue.number.to_i)
+  end
+  selected_issues.each { |issue| copy_issue(target, issue) }
+  selected_issues.each { |issue| puts evaluation_item_report(issue) }
+end
+
+def copy_issue(target, issue)
+  public_body, private_section = issue.body.split(PRIVATE_SECTION_SEPARATOR)
+  unless private_section
+    unless agree("[issue #{issue.number}] Could not identify a private section. Issue may be malformatted. Want to copy anyway?(y/n) ", true)
+      return
+    end
+  end
+  github.create_issue(target, issue.title, public_body)
+end
+
+def clone_repository(origin, target)
+  system(
+    [
+      "git clone --depth 1 -b master git@github.com:#{origin}.git #{target}",
+      "cd #{target}",
+      'rm -rf .git'
+    ].join(' && ')
+  )
+end
+
+def setup_remote(target_dir, remote_repo)
+  system(
+    [
+      "cd #{target_dir}",
+      'git init',
+      'git add .',
+      'git commit -m "first commit"',
+      "git remote add origin #{remote_repo.ssh_url}",
+      'git push -u origin master'
+    ].join(' && ')
+  )
+end
+
+def create_project(target)
+  user = github.user.login
+  organization = choose("Which Github Organization? \n") do |menu|
+    menu.choices(*([user] + github.organizations.map(&:login)))
+    menu.default = user
+  end
+  project_name = ask('Project name? ') {|q| q.default = target }
+  attrs = repo_attributes
+  attrs[:organization] = organization unless user == organization
+  attrs[:private] = agree('Private repository?(y/n) ', true)
+
+  begin
+    new_repo = github.create_repository(project_name, attrs)
+
+    if agree("Would you like setup the local repo?(y/n) ", true)
+      setup_remote(target, new_repo)
+    end
+
+    if agree("Would you like to select issues to copy(y/n) ", true)
+      copy_and_report_issues(new_repo.full_name)
+    end
+
+    if agree('Would you like to open the project in your browser?(y/n) ', true)
+      system "open #{new_repo.html_url}"
+    end
+  rescue => e
+    say "The repository could not be created: #{e.message}"
+  end
+end
+
+def repo_attributes
+  {
+    has_issues: true,
+    has_wiki: false
+  }
+end
