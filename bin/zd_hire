@@ -19,6 +19,12 @@ QUESTIONS = {
 PRIVATE_SECTION_SEPARATOR = '## PRIVATE'
 EVALUATION_SEPARATOR = '## EVALUATION'
 DEFAULT_ISSUE_LABEL = 'default_issue'
+POSITION_LEVEL_LABELS = %w{
+  software_engineer
+  senior_software_engineer
+  staff_engineer
+  senior_staff_engineer
+}
 
 def token_validator
   ->(token) {
@@ -87,9 +93,16 @@ command :init do |c|
 end
 
 command :clone do |c|
+  c.syntax = 'zd_hire clone REPOSITORY NAME'
+  c.description = 'Sets up repository for candidate'
+  c.option '--custom', TrueClass, 'Whether should run in custom mode'
+  c.option '--verbose', TrueClass, 'Whether should run in verbose mode'
   c.action do |args, options|
+    $custom = options.custom
+    $verbose = options.verbose
+
     if config.valid?
-      target = ask(QUESTIONS[:target_repo]) do |q|
+      target = args.first || ask(QUESTIONS[:target_repo]) do |q|
         q.validate = target_validator
         q.responses.merge!(not_valid: "Target and origin repositories can't be the same")
       end
@@ -97,15 +110,16 @@ command :clone do |c|
     else
       say 'Run `zd_hire init` to configure github keys'
     end
-    if agree('Would you like to create a Github Project?(y/n) ', true)
+    agree_if_custom('Would you like to create a Github Project?(y/n) ', true) do
       create_project(target)
     end
   end
 end
 
 def create_pr(new_repo)
+  say "Copying Pull Request..."
   origin_pull_requests.each {|pr| say "[#{pr.number}] #{pr.head.ref}: #{pr.title}" }
-  pr_number = ask('Which Pull Request? ')
+  pr_number = ask('Which Pull Request? [The branch must also be available locally] ')
   selected = origin_pull_requests.detect {|pr| pr.number.to_i == pr_number.to_i }
   exit unless selected
   branch = selected.head.ref
@@ -116,13 +130,23 @@ def create_pr(new_repo)
     "git push origin #{branch}"
   ].join(' && ')
   
-  `#{command}`
+  say "Pulling from local branch..."
+  execute(command, wait_response: true)
   sleep 1
+  say "Creating PR in target repository..."
   github.create_pull_request(new_repo.full_name, 'master', branch, selected.title, selected.body)
 end
 
 def origin_default_issue
-  @df ||= origin_repo_issues.detect{|issue| issue.labels.any?{ |l| l.name == DEFAULT_ISSUE_LABEL} }
+  @df ||= origin_repo_issues.detect{ |issue| has_label?(issue, DEFAULT_ISSUE_LABEL) }
+end
+
+def issues_by_label(label)
+  origin_repo_issues.select { |issue| has_label?(issue, label) }
+end
+
+def has_label?(issue, label)
+  issue.labels.any? { |l| l.name == label }
 end
 
 def evaluation_items(issue)
@@ -154,15 +178,33 @@ def origin_pull_requests
   @prs ||= github.pull_requests(config.origin_repo)
 end
 
-def copy_and_report_issues(target)
+def copy_issues(target)
+  selected_issues = $custom ? pick_issues : issues_for_position
+  say "Copying issues..."
+  selected_issues.each { |issue| copy_issue(target, issue) }
+
+  report_issues(selected_issues) if $custom
+end
+
+def pick_issues
   issues = presentable_issues
   issues.each { |i| say "#{i.number}: #{i.title}" }
   issue_ids = ask('Type Issue IDs separated by spaces: ', Array).map(&:to_i)
-  selected_issues = issues.select do |issue|
+  issues.select do |issue|
     issue_ids.include?(issue.number.to_i)
   end
-  selected_issues.each { |issue| copy_issue(target, issue) }
-  selected_issues.each { |issue| puts evaluation_item_report(issue) }
+end
+
+def issues_for_position
+  position = choose("Which Position? \n") do |menu|
+    menu.choices(*POSITION_LEVEL_LABELS)
+  end
+  issues_by_label(position)
+end
+
+def report_issues(issues)
+  say "Reporting issues..."
+  issues.each { |issue| puts evaluation_item_report(issue) }
 end
 
 def copy_issue(target, issue)
@@ -176,21 +218,23 @@ def copy_issue(target, issue)
 end
 
 def clone_repository(origin, target)
-  system(
-    [
-      "git clone git@github.com:#{origin}.git -b master --single-branch #{target}",
-    ].join(' && ')
-  )
+  say "Cloning repository..."
+  command = [
+    "git clone git@github.com:#{origin}.git -b master --single-branch #{target}",
+  ].join(' && ')
+  
+  execute(command)
 end
 
 def setup_remote(target_dir, remote_repo)
-  system(
-    [
-      "cd #{target_dir}",
-      "git remote set-url origin #{remote_repo.ssh_url}",
-      'git push -u origin master'
-    ].join(' && ')
-  )
+  say "Setting up remote..."
+  command = [
+    "cd #{target_dir}",
+    "git remote set-url origin #{remote_repo.ssh_url}",
+    'git push -u origin master'
+  ].join(' && ')
+  
+  execute(command)
 end
 
 def create_project(target)
@@ -199,31 +243,54 @@ def create_project(target)
     menu.choices(*([user] + github.organizations.map(&:login)))
     menu.default = user
   end
-  project_name = ask('Project name? ') {|q| q.default = target }
+  project_name = ask_if_custom('Project name? ', target)
   attrs = repo_attributes
   attrs[:organization] = organization unless user == organization
-  attrs[:private] = agree('Private repository?(y/n) ', true)
+  attrs[:private] = agree('Private repository [Requires paid Github Account]?(y/n) ', true)
 
   begin
+    say "Creating Github project..."
     new_repo = github.create_repository(project_name, attrs)
 
-    if agree("Would you like setup the local repo?(y/n) ", true)
+    agree_if_custom("Would you like setup the local repo?(y/n) ", true) do
       setup_remote(target, new_repo)
     end
 
-    if agree("Would you like to select issues to copy(y/n) ", true)
-      copy_and_report_issues(new_repo.full_name)
+    agree_if_custom("Would you like to select issues to copy(y/n) ", true) do
+      copy_issues(new_repo.full_name)
     end
 
-    if agree("Would you like to copy a Pull Request(y/n) ", true)
+    agree_if_custom("Would you like to copy a Pull Request(y/n) ", true) do
       create_pr(new_repo)
     end
 
-    if agree('Would you like to open the project in your browser?(y/n) ', true)
+    agree_if_custom('Would you like to open the project in your browser?(y/n) ', true) do
       system "open #{new_repo.html_url}"
     end
   rescue => e
     say "The repository could not be created: #{e.message}"
+  end
+end
+
+def execute(command, wait_response: false)
+  say(command) if $verbose
+  wait_response ? `#{command}` : system(command)
+end
+
+def ask_if_custom(question, default)
+  if $custom
+    ask(question) {|q| q.default = default }
+  else
+    default
+  end
+end
+
+def agree_if_custom(*args, &block)
+  raise LocalJumpError unless block_given? 
+  if $custom
+    yield if agree(*args)
+  else
+    yield
   end
 end
 
